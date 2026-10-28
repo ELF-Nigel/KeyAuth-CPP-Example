@@ -24,8 +24,8 @@ permissions:
   contents: read
 
 env:
-  KEYAUTH_LIBRARY_COMMIT: e345db830576b7a14cf1a818ffd4a3b368fb228b
-  KEYAUTH_LIBRARY_SHA256: 93583a96377956b0092b6c037c5c258fc73881e694f57cff305ec658d62a5ab4
+  KEYAUTH_LIBRARY_COMMIT: a21bc128105f52fb70bfa22d851182ddbdc2129d
+  KEYAUTH_LIBRARY_SHA256: 0238997e8ffdcb914221ff3ad8c771dc2f414ed5892c47ad2819b857667d0deb
 
 jobs:
   build:
@@ -42,9 +42,16 @@ jobs:
       - name: Verify paired library
         shell: pwsh
         run: |
-          $expected = [IO.File]::ReadAllText('.keyauth-source/auth.hpp').Replace("`r`n", "`n")
-          $actual = [IO.File]::ReadAllText('x64/lib/auth.hpp').Replace("`r`n", "`n")
-          if ($actual -cne $expected) { throw 'Bundled header does not match the selected library source.' }
+          foreach ($header in @('auth.hpp', 'xorstr.hpp', 'curl/curl.h', 'curl/curlver.h', 'libsodium/sodium/version.h')) {
+            $expected = [IO.File]::ReadAllText(".keyauth-source/$header").Replace("`r`n", "`n")
+            $actual = [IO.File]::ReadAllText("x64/lib/$header").Replace("`r`n", "`n")
+            if ($actual -cne $expected) { throw "Bundled $header does not match the selected library source." }
+          }
+          foreach ($dependency in @('curl/libcurl.lib', 'curl/zlib.lib', 'libsodium/libsodium.lib')) {
+            $expected = (Get-FileHash -LiteralPath ".keyauth-source/$dependency" -Algorithm SHA256).Hash
+            $actual = (Get-FileHash -LiteralPath "x64/lib/$dependency" -Algorithm SHA256).Hash
+            if ($actual -cne $expected) { throw "Bundled dependency does not match selected library: $dependency" }
+          }
           $digest = (Get-FileHash -LiteralPath 'x64/library_x64.lib' -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -cne $env:KEYAUTH_LIBRARY_SHA256) { throw 'Bundled library does not match the verified build.' }
 
@@ -79,6 +86,85 @@ jobs:
         working-directory: x64
         run: msbuild example.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /m
 
+      - name: Credential storage checks
+        shell: pwsh
+        run: |
+          $installation = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $installation 'Common7/Tools/VsDevCmd.bat'
+          $compilerEnvironment = & cmd.exe /c "`"$devcmd`" -arch=x64 >nul && set"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($entry in $compilerEnvironment) {
+            if ($entry -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+          }
+          $canaryDirectory = Join-Path $env:RUNNER_TEMP 'dll-search-check'
+          New-Item -ItemType Directory -Path $canaryDirectory -Force | Out-Null
+          $canarySource = Join-Path $canaryDirectory 'canary.cpp'
+          'extern "C" __declspec(dllexport) int keyauth_search_canary() { return 7; }' | Set-Content -LiteralPath $canarySource
+          & cl.exe /nologo /LD /MD $canarySource "/Fo$canaryDirectory/canary.obj" "/Fe$canaryDirectory/keyauth-search-canary.dll" /link "/IMPLIB:$canaryDirectory/canary.lib"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $source = Join-Path $env:RUNNER_TEMP 'storage-checks.cpp'
+          @'
+          #include "utils.hpp"
+          #include <iostream>
+          #include <iterator>
+          int main(int argc, char** argv) {
+              if (argc != 3) return 1;
+              if (!configureSafeDllSearch()) return 10;
+              const auto original = std::filesystem::current_path();
+              std::filesystem::current_path(argv[2]);
+              HMODULE module = LoadLibraryW(L"keyauth-search-canary.dll");
+              if (module) { FreeLibrary(module); return 11; }
+              const auto directory = std::filesystem::absolute(argv[2]).wstring();
+              const auto cookie = AddDllDirectory(directory.c_str());
+              if (!cookie) return 12;
+              module = LoadLibraryW(L"keyauth-search-canary.dll");
+              if (!module) return 13;
+              const auto canary = reinterpret_cast<int(*)()>(GetProcAddress(module, "keyauth_search_canary"));
+              const bool valid = canary && canary() == 7;
+              FreeLibrary(module);
+              RemoveDllDirectory(cookie);
+              std::filesystem::current_path(original);
+              if (!valid) return 14;
+              const std::string path = argv[1];
+              const auto raw_read = [&] {
+                  std::ifstream file(path, std::ios::binary);
+                  return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+              };
+              {
+                  std::ofstream file(path);
+                  file << R"({"username":"legacy","password":"old-password"})";
+              }
+              if (ReadFromJson(path, "password") != "old-password" || !CheckIfJsonKeyExists(path, "username")) return 2;
+              if (!WriteToJson(path, "username", "user", true, "password", "saved-passphrase")) return 3;
+              const auto encrypted = raw_read();
+              if (encrypted.rfind("keyauth:dpapi:v1:", 0) != 0 || encrypted.find("saved-passphrase") != std::string::npos) return 4;
+              if (ReadFromJson(path, "password") != "saved-passphrase" || !CheckIfJsonKeyExists(path, "username")) return 5;
+              if (WriteToJson(path, "password", std::string(1024 * 1024, 'x'), false, "", "") || raw_read() != encrypted) return 6;
+              {
+                  auto corrupted = encrypted;
+                  corrupted.back() = 'z';
+                  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+                  file << corrupted;
+              }
+              if (!ReadFromJson(path, "password").empty() || CheckIfJsonKeyExists(path, "username")) return 7;
+              {
+                  std::ofstream file(path);
+                  file << R"({"username":123,"password":true})";
+              }
+              if (!ReadFromJson(path, "username").empty() || !CheckIfJsonKeyExists(path, "username")) return 8;
+              if (!WriteToJson(path, "license", "test-license", false, "", "") || ReadFromJson(path, "license") != "test-license") return 9;
+              std::filesystem::remove(path);
+              std::cout << "Credential storage, legacy compatibility, and DLL search checks passed\n";
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath $source
+          $object = Join-Path $env:RUNNER_TEMP 'storage-checks.obj'
+          $executable = Join-Path $env:RUNNER_TEMP 'storage-checks.exe'
+          & cl.exe /nologo /std:c++17 /EHsc /MD /DNDEBUG /DSODIUM_STATIC "/I$env:GITHUB_WORKSPACE/x64" "/I$env:GITHUB_WORKSPACE/x64/lib" "/I$env:GITHUB_WORKSPACE/x64/lib/libsodium" $source "/Fo$object" "/Fe$executable" /link "$env:GITHUB_WORKSPACE/x64/library_x64.lib" "$env:GITHUB_WORKSPACE/x64/lib/curl/zlib.lib" user32.lib shell32.lib winhttp.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $executable (Join-Path $env:RUNNER_TEMP 'credential-storage-test.json') $canaryDirectory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Verify executable mitigations
         shell: pwsh
         run: |
@@ -87,9 +173,82 @@ jobs:
           if (-not $dumpbin) { throw 'Executable inspection tool was not found.' }
           $headers = (& $dumpbin.FullName /headers /loadconfig 'x64/x64/Release/example.exe') -join "`n"
           if ($LASTEXITCODE -ne 0) { throw 'Executable inspection failed.' }
-          foreach ($required in @('CF instrumented', 'FID table present', 'Dynamic base', 'NX compatible', 'High Entropy Virtual Addresses')) {
+          if ($headers -notmatch '(?im)^\s*0*A00\s+Dependent load flags?') { throw 'Missing application/System32 import search policy.' }
+          foreach ($required in @('CF instrumented', 'FID table present', 'Dynamic base', 'NX compatible', 'High Entropy Virtual Addresses', 'CET compatible', 'EH Continuation table present')) {
             if ($headers -notmatch [regex]::Escape($required)) { throw "Missing executable mitigation: $required" }
           }
+
+          function Assert-ImportTable([byte[]]$image) {
+            $pe = [BitConverter]::ToInt32($image, 60)
+            $optional = $pe + 24
+            $optionalSize = [BitConverter]::ToUInt16($image, $pe + 20)
+            if ($optionalSize -lt 216 -or $optional -gt $image.Length - $optionalSize -or [BitConverter]::ToUInt16($image, $optional) -ne 0x20b) { throw 'Invalid x64 optional header.' }
+            if ([BitConverter]::ToUInt32($image, $optional + 108) -lt 13) { throw 'Import address directory is missing.' }
+            $iat = [uint64][BitConverter]::ToUInt32($image, $optional + 208)
+            $size = [uint64][BitConverter]::ToUInt32($image, $optional + 212)
+            if ($iat -eq 0 -or $size -lt 8 -or ($iat % 8) -ne 0 -or ($size % 8) -ne 0) { throw 'Invalid import address directory.' }
+            $count = [BitConverter]::ToUInt16($image, $pe + 6)
+            $table = $optional + $optionalSize
+            for ($i = 0; $i -lt $count; $i++) {
+              $section = $table + 40 * $i
+              $start = [uint64][BitConverter]::ToUInt32($image, $section + 12)
+              $length = [uint64][Math]::Max([BitConverter]::ToUInt32($image, $section + 8), [BitConverter]::ToUInt32($image, $section + 16))
+              if ($iat -ge $start -and $iat + $size -le $start + $length) {
+                $flags = [BitConverter]::ToUInt32($image, $section + 36)
+                if (($flags -band 0x40000000) -eq 0 -or ($flags -band 2684354560) -ne 0) { throw 'Import address table must be readable, non-writable and non-executable.' }
+                return $section
+              }
+            }
+            throw 'Import address table is outside image sections.'
+          }
+
+          function Assert-CodeSections([byte[]]$image) {
+            if ($image.Length -lt 64 -or [BitConverter]::ToUInt16($image, 0) -ne 0x5a4d) { throw 'Invalid DOS header.' }
+            $pe = [BitConverter]::ToInt32($image, 60)
+            if ($pe -lt 64 -or $pe -gt $image.Length - 24 -or [BitConverter]::ToUInt32($image, $pe) -ne 0x4550) { throw 'Invalid PE header.' }
+            if ([BitConverter]::ToUInt32($image, $pe + 12) -ne 0 -or [BitConverter]::ToUInt32($image, $pe + 16) -ne 0) { throw 'Release executable contains a COFF symbol table.' }
+            $count = [BitConverter]::ToUInt16($image, $pe + 6)
+            $table = $pe + 24 + [BitConverter]::ToUInt16($image, $pe + 20)
+            if ($count -eq 0 -or $table -gt $image.Length - 40 * $count) { throw 'Invalid section table.' }
+            $text = -1
+            for ($i = 0; $i -lt $count; $i++) {
+              $section = $table + 40 * $i
+              $name = [Text.Encoding]::ASCII.GetString($image, $section, 8).TrimEnd([char]0)
+              $flags = [BitConverter]::ToUInt32($image, $section + 36)
+              if (($flags -band 0x20000000) -and ($flags -band 2147483648)) { throw 'Executable section is writable.' }
+              if ($name -eq '.text') {
+                if (($flags -band 0x60000000) -ne 0x60000000) { throw '.text must be readable and executable.' }
+                $text = $section
+              }
+            }
+            if ($text -lt 0) { throw '.text section was not found.' }
+            return $text
+          }
+          $image = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath 'x64/x64/Release/example.exe').Path)
+          $text = Assert-CodeSections $image
+          $iatSection = Assert-ImportTable $image
+          foreach ($unsafeFlag in @([uint64]2147483648, [uint64]536870912)) {
+            $invalidImports = [byte[]]$image.Clone()
+            $flags = [uint32]([uint64][BitConverter]::ToUInt32($invalidImports, $iatSection + 36) -bor $unsafeFlag)
+            [BitConverter]::GetBytes($flags).CopyTo($invalidImports, $iatSection + 36)
+            $rejected = $false
+            try { Assert-ImportTable $invalidImports | Out-Null } catch { $rejected = $true }
+            if (-not $rejected) { throw 'Unsafe import address table permissions were not detected.' }
+          }
+          Write-Output 'Read-only, non-executable import table checks passed'
+          $invalid = [byte[]]$image.Clone()
+          $flags = [uint32]([uint64][BitConverter]::ToUInt32($invalid, $text + 36) -bor 2147483648)
+          [BitConverter]::GetBytes($flags).CopyTo($invalid, $text + 36)
+          $rejected = $false
+          try { Assert-CodeSections $invalid | Out-Null } catch { $rejected = $true }
+          if (-not $rejected) { throw 'Writable executable section regression was not detected.' }
+          $invalid = [byte[]]$image.Clone()
+          $pe = [BitConverter]::ToInt32($invalid, 60)
+          [BitConverter]::GetBytes([uint32]1).CopyTo($invalid, $pe + 16)
+          $rejected = $false
+          try { Assert-CodeSections $invalid | Out-Null } catch { $rejected = $true }
+          if (-not $rejected) { throw 'COFF symbol exposure regression was not detected.' }
+          if ($headers -match '(?im)^\s*[0-9a-f]{8}\s+cv\s') { throw 'Release executable includes a CodeView debug record.' }
 
       - name: Package runnable example
         shell: pwsh

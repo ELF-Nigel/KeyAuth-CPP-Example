@@ -4,8 +4,7 @@
 
 inline bool CheckIfJsonKeyExists(const std::string& path, const std::string& section)
 {
-    std::ifstream file(path);
-    if (!file.good()) return false;
-    const auto data = json::parse(file, nullptr, false);
-    return data.is_object() && data.contains(section);
+    auto data = saved_data_detail::read(path);
+    saved_data_detail::JsonWipe wipe{data};
+    return data.contains(section);
 }

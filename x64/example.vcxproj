@@ -146,13 +146,15 @@
       <BufferSecurityCheck>true</BufferSecurityCheck>
       <PreprocessorDefinitions>CURL_STATICLIB;SODIUM_STATIC;_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <DebugInformationFormat>None</DebugInformationFormat>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/guard:ehcont %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalOptions>/GUARD:CF %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/GUARD:CF /GUARD:EHCONT /CETCOMPAT /DEPENDENTLOADFLAG:0xA00 %(AdditionalOptions)</AdditionalOptions>
       <RandomizedBaseAddress>true</RandomizedBaseAddress>
       <HighEntropyVA>true</HighEntropyVA>
       <DataExecutionPrevention>true</DataExecutionPrevention>

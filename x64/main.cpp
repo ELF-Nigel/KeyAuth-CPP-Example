@@ -122,10 +122,13 @@ bool try_auto_login(api& app, std::string& username, std::string& password, std:
     if (!std::filesystem::exists(api::kSavePath))
         return false;
 
-    const auto saved_license = ReadFromJson(api::kSavePath, "license");
-    const auto saved_username = ReadFromJson(api::kSavePath, "username");
-    const auto saved_password = ReadFromJson(api::kSavePath, "password");
+    auto saved_license = ReadFromJson(api::kSavePath, "license");
+    auto saved_username = ReadFromJson(api::kSavePath, "username");
+    auto saved_password = ReadFromJson(api::kSavePath, "password");
 
+    saved_data_detail::StringWipe wipe_license{saved_license};
+    saved_data_detail::StringWipe wipe_username{saved_username};
+    saved_data_detail::StringWipe wipe_password{saved_password};
     if (!saved_license.empty()) {
         key = saved_license;
         app.license(key);
@@ -142,21 +145,22 @@ bool try_auto_login(api& app, std::string& username, std::string& password, std:
     return false;
 }
 
-void save_or_clear_creds(bool save, const std::string& username, const std::string& password, const std::string& key) {
+bool save_or_clear_creds(bool save, const std::string& username, const std::string& password, const std::string& key) {
     if (!save) {
-        std::remove(api::kSavePath); // remove stale creds when opting out. -nigel
-        return;
+        std::error_code error;
+        std::filesystem::remove(api::kSavePath, error);
+        return !error;
     }
 
     if (username.empty() || password.empty()) {
-        WriteToJson(api::kSavePath, "license", key, false, "", "");
-        return;
+        return WriteToJson(api::kSavePath, "license", key, false, "", "");
     }
 
-    WriteToJson(api::kSavePath, "username", username, true, "password", password);
+    return WriteToJson(api::kSavePath, "username", username, true, "password", password);
 }
 
 void print_user_data(const api& app) {
+    if (!app.authenticated()) throw request_error("A verified login is required to display account data.");
     std::cout << skCrypt("\n User data:");
     std::cout << skCrypt("\n Username: ") << app.user_data.username;
     std::cout << skCrypt("\n IP address: ") << app.user_data.ip;
@@ -188,11 +192,14 @@ std::string version = skCrypt("1.0").decrypt(); // Application version. Used for
 std::string url = skCrypt("https://keyauth.win/api/1.3/").decrypt(); // change if using KeyAuth custom domains feature
 std::string path = skCrypt("").decrypt(); // (OPTIONAL) see tutorial here https://www.youtube.com/watch?v=I9rxt821gMk&t=1s
 
+std::vector<std::string> tls_public_key_pins{};
+
 api KeyAuthApp(name, ownerid, version, url, path);
 api::lockout_state login_guard{};
 
 int main() try
 {
+    configureSafeDllSearch();
     std::string consoleTitle = skCrypt("Loader - Built at:  ").decrypt() + compilation_date + " " + compilation_time;
     SetConsoleTitleA(consoleTitle.c_str());
     std::cout << skCrypt("\n\n Connecting..");
@@ -201,6 +208,10 @@ int main() try
     for (std::string* setting : {&name, &ownerid, &version, &url, &path}) {
         if (!setting->empty()) SecureZeroMemory(setting->data(), setting->size());
         setting->clear();
+    }
+    if (!tls_public_key_pins.empty()) {
+        KeyAuthApp.set_pinned_public_keys(tls_public_key_pins);
+        KeyAuthApp.require_pinning = true;
     }
     KeyAuthApp.init();
     if (!KeyAuthApp.response.success)
@@ -224,6 +235,11 @@ int main() try
     std::string key;
     std::string TfaCode;
     std::string email;
+    saved_data_detail::StringWipe wipe_username{username};
+    saved_data_detail::StringWipe wipe_password{password};
+    saved_data_detail::StringWipe wipe_key{key};
+    saved_data_detail::StringWipe wipe_code{TfaCode};
+    saved_data_detail::StringWipe wipe_email{email};
     bool email_password = false;
     bool passwordless = false;
 
@@ -360,9 +376,11 @@ int main() try
         std::cout << skCrypt("\n\n Save credentials to disk for auto-login? [y/N]: ");
         const char save_choice = read_choice('n'); // read once to avoid double input. -nigel
         const bool save_creds = (save_choice == 'y' || save_choice == 'Y');
-        save_or_clear_creds(save_creds, username, password, key);
-        if (save_creds)
+        const bool stored = save_or_clear_creds(save_creds, username, password, key);
+        if (save_creds && stored)
             std::cout << skCrypt("Successfully Created File For Auto Login");
+        else if (!stored)
+            std::cout << "\n Could not update saved credentials. You can still continue.";
 
     }
 
